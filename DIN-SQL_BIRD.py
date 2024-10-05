@@ -3,26 +3,20 @@ import re
 import pandas as pd
 import json
 import glob
+import argparse
 
 from typing import List, Tuple
-from langchain.sql_database import SQLDatabase
-from langchain.chat_models import ChatOpenAI
+# from langchain.sql_database import SQLDatabase
+from langchain_community.utilities import SQLDatabase
+# from langchain.chat_models import ChatOpenAI, AzureOpenAI
 from langchain.chains import LLMChain
 from langchain.prompts import (
     ChatPromptTemplate,
     SystemMessagePromptTemplate,
     HumanMessagePromptTemplate,
 )
+from azure_open_ai import AZURE_OPENAI_MODEL_LIST, get_azure_lm, get_openai_lm
 
-
-# CHANGE THIS TO YOUR OPENAI API KEY
-
-os.environ["OPENAI_API_KEY"] = ""
-CHAT = ChatOpenAI(model="gpt-4-32k",temperature=0,max_tokens=2000)
-dev_db_path = "dev/dev_databases"
-dev_df = pd.read_json("dev/dev.json")
-
-# ----------------------- #
 
 SYSTEM_SCHEMA_LINKING_TEMPLATE = """
 You are an agent designed to find the schema_links for generating SQL queries for each question based on the database schema and Foreign keys.
@@ -1125,7 +1119,8 @@ def extract_schema_links(input_text: str) -> List[str]:
         return []
     
 def extract_label_and_sub_questions(input_text: str) -> Tuple[str, List[str]]:
-    label_pattern = r'Label:\s*"(.*?)"'
+    # label_pattern = r'Label:\s*"(.*?)"'
+    label_pattern = r'Label:\s*(?:\*\*)?(.*?)(?:\*\*)?\s*$'
     sub_questions_pattern = r'sub_questions:\s*\[(.*?)\]'
 
     label_match = re.search(label_pattern, input_text)
@@ -1140,15 +1135,30 @@ def extract_label_and_sub_questions(input_text: str) -> Tuple[str, List[str]]:
 
     return label, sub_questions
 
+def extract_sql_query_in_markdown_format(input_text):
+    match = re.search(r"```sql[ \n](.*?)[ \n]```?", input_text, re.DOTALL)
+    if match is None:
+        match = re.search(r"```[ \n](.*?)[ \n]```?", input_text, re.DOTALL)
+    sql = (match.group(1) if match else input_text).replace('```', '')  # .replace("\\n", "\n")
+    return sql
+
 def extract_sql_query(input_text):
     sql_pattern = r'SQL:\s*(.*?)$'
     match = re.search(sql_pattern, input_text, re.DOTALL)
-    return match.group(1).strip() if match else None
+    if match:
+        sql = match.group(1).strip()
+    else:
+        sql = extract_sql_query_in_markdown_format(input_text)
+    return sql
 
 def extract_revised_sql_query(input_text):
     sql_pattern = r'Revised_SQL:\s*(.*?)$'
     match = re.search(sql_pattern, input_text, re.DOTALL)
-    return match.group(1).strip() if match else None
+    if match:
+        sql = match.group(1).strip()
+    else:
+        sql = extract_sql_query_in_markdown_format(input_text)
+    return sql
 
 def update_json_file(json_filename, index, sql_query, db_id):
     try:
@@ -1188,6 +1198,29 @@ def table_descriptions_parser(database_dir):
 start_index = 0
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_name", type=str, default='gpt-4-0613')
+    parser.add_argument("--save_dir", type=str, default='results')
+    parser.add_argument("--dataset_name", type=str, default='bird')
+    parser.add_argument("--dataset_split", type=str, default='dev')
+    parser.add_argument("--azure", type=bool, default=True)
+    parser.add_argument("--DEBUG", type=bool, default=False)
+
+
+    args = parser.parse_args()
+
+    # CHANGE THIS TO YOUR OPENAI API KEY
+    # os.environ["OPENAI_API_KEY"] = ""
+    # CHAT = ChatOpenAI(model="gpt-4-32k",temperature=0,max_tokens=2000)
+    if args.azure:
+        CHAT = get_azure_lm(args.model_name, DEBUG=args.DEBUG)
+    else:
+        CHAT = get_openai_lm(args.model_name, DEBUG=args.DEBUG)
+
+    assert args.dataset_name == 'bird' and args.dataset_split == 'dev'
+    dev_db_path = "dev/dev_databases"
+    dev_df = pd.read_json("dev/dev.json")
+
     logs_df = pd.DataFrame(
         columns=["question","gold_query","db_id","final_query","schema_linking","classification","sql_generation","self_correction"])
 
@@ -1240,6 +1273,7 @@ if __name__ == "__main__":
             hint=hint,
             columns_descriptions=columns_descriptions,
             schema_links=schema_links)
+        print(f"{classification=}")
         label, sub_questions = extract_label_and_sub_questions(classification)
         print("Label: ", label)
         sql_generation = None
@@ -1281,6 +1315,7 @@ if __name__ == "__main__":
             columns_descriptions=columns_descriptions,
             hint=hint,
             sql_query=sql_query)
+        print(f"{correction=}")
         finall_sql = extract_revised_sql_query(correction)
         if finall_sql is not None:
             one_liner_sql_query = finall_sql.replace('\n', '').replace('\r', '')
@@ -1293,8 +1328,10 @@ if __name__ == "__main__":
             [[question,row["SQL"],row["db_id"],one_liner_sql_query,schema_linking, classification, sql_generation, correction]],  # noqa: E501
             columns=["question","gold_query","db_id","final_query","schema_linking","classification","sql_generation","self_correction"])
         logs_df = pd.concat([logs_df, new_row_df], ignore_index=True)
-        logs_df.to_csv("logs.csv", index=False)
-        update_json_file("predict_dev.json", index, one_liner_sql_query, row["db_id"])
+
+        os.makedirs(f"{args.save_dir}/{args.model_name}", exist_ok=True)
+        logs_df.to_csv(f"{args.save_dir}/{args.model_name}/logs.csv", index=False)
+        update_json_file(f"{args.save_dir}/{args.model_name}/predict_dev.json", index, one_liner_sql_query, row["db_id"])
         print("final sql query: ", one_liner_sql_query)
         print("Gold sql query: ", row["SQL"])
-        print("--------------------------------------------------")   
+        print("--------------------------------------------------")
